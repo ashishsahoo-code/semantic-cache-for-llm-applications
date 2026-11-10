@@ -1,16 +1,13 @@
-import json
-import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import redis.asyncio as redis
-from redis.commands.search.field import NumericField, TagField, TextField, VectorField
+from redis.commands.search.field import TagField, TextField, VectorField
 from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.query import Query
 from redis.exceptions import ResponseError
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,8 +39,10 @@ class RedisSemanticCache:
             await self.client.ft(self.index_name).info()
             self._index_ready = True
             return
-        except ResponseError:
-            pass
+        except ResponseError as exc:
+            # Only create the index when Redis says it does not exist.
+            if "unknown index" not in str(exc).lower():
+                raise
 
         schema = (
             TagField("tenant"),
@@ -51,7 +50,6 @@ class RedisSemanticCache:
             TagField("locale"),
             TextField("prompt"),
             TextField("answer"),
-            NumericField("created_at"),
             VectorField(
                 "embedding",
                 "HNSW",
@@ -68,14 +66,23 @@ class RedisSemanticCache:
         try:
             await self.client.ft(self.index_name).create_index(schema, definition=definition)
         except ResponseError as exc:
-            # Another worker may have created the index between INFO and CREATE.
             if "already exists" not in str(exc).lower():
                 raise
         self._index_ready = True
 
     @staticmethod
     def _vector_bytes(vector: list[float]) -> bytes:
-        return np.asarray(vector, dtype=np.float32).tobytes()
+        values = np.asarray(vector, dtype=np.float32)
+        if values.ndim != 1:
+            raise ValueError("Embedding must be a one-dimensional vector")
+        return values.tobytes()
+
+    @staticmethod
+    def _tag_escape(value: str) -> str:
+        escaped = value.replace("\\", "\\\\")
+        for char in ",.<>!?@#$%^&*()-+=~{}[]|":
+            escaped = escaped.replace(char, f"\\{char}")
+        return escaped
 
     async def lookup(
         self,
@@ -95,7 +102,7 @@ class RedisSemanticCache:
             "=>[KNN 1 @embedding $vector AS vector_distance]"
         )
         result = await self.client.ft(self.index_name).search(
-            __import__("redis.commands.search.query", fromlist=["Query"]).Query(query)
+            Query(query)
             .sort_by("vector_distance")
             .return_fields("answer", "vector_distance")
             .paging(0, 1)
@@ -142,21 +149,10 @@ class RedisSemanticCache:
             clauses.append(f"@model:{{{self._tag_escape(model)}}}")
         if locale:
             clauses.append(f"@locale:{{{self._tag_escape(locale)}}}")
-        query = " ".join(clauses)
-        from redis.commands.search.query import Query
-
         result = await self.client.ft(self.index_name).search(
-            Query(query).return_fields().paging(0, 10_000)
+            Query(" ".join(clauses)).return_fields().paging(0, 10_000)
         )
         keys = [doc.id for doc in result.docs]
         if not keys:
             return 0
         return int(await self.client.delete(*keys))
-
-    @staticmethod
-    def _tag_escape(value: str) -> str:
-        # Redis Search TAG syntax reserves punctuation; escape query metacharacters.
-        escaped = value.replace("\\", "\\\\")
-        for char in ",.<>!?@#$%^&*()-+=~":
-            escaped = escaped.replace(char, f"\\{char}")
-        return escaped
