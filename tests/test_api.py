@@ -14,7 +14,6 @@ class FakeRedis:
 class FakeCache:
     def __init__(self):
         self.items = {}
-        self.deleted = 0
 
     async def lookup(self, *, tenant, model, locale, embedding, threshold):
         key = (tenant, model, locale, tuple(embedding))
@@ -28,13 +27,21 @@ class FakeCache:
         return "fake-key"
 
     async def invalidate(self, *, tenant, model, locale):
-        count = len(self.items)
-        self.items.clear()
-        return count
+        matching_keys = [
+            key
+            for key in self.items
+            if key[0] == tenant
+            and (model is None or key[1] == model)
+            and (locale is None or key[2] == locale)
+        ]
+        for key in matching_keys:
+            del self.items[key]
+        return len(matching_keys)
 
 
 class FakeEmbedder:
     def embed(self, text):
+        # Keep embeddings identical so these tests isolate metadata scoping behavior.
         return [1.0, 0.0, 0.0]
 
 
@@ -51,21 +58,69 @@ def setup_app():
     return TestClient(app)
 
 
+def generate(client, *, tenant, model="test-model", locale="en", prompt="hello world"):
+    return client.post(
+        "/v1/generate",
+        headers={"X-Tenant-ID": tenant},
+        json={"prompt": prompt, "model": model, "locale": locale},
+    )
+
+
 def test_generate_miss_then_hit():
     client = setup_app()
     try:
-        headers = {"X-Tenant-ID": "tenant-a"}
-        body = {"prompt": "hello world", "model": "test-model", "locale": "en"}
-
-        first = client.post("/v1/generate", json=body, headers=headers)
+        first = generate(client, tenant="tenant-a")
         assert first.status_code == 200
         assert first.json()["cache_hit"] is False
         assert first.headers["x-cache-status"] == "MISS"
 
-        second = client.post("/v1/generate", json=body, headers=headers)
+        second = generate(client, tenant="tenant-a")
         assert second.status_code == 200
         assert second.json()["cache_hit"] is True
         assert second.headers["x-cache-status"] == "HIT"
+    finally:
+        client.close()
+
+
+def test_cache_isolated_by_tenant_model_and_locale():
+    client = setup_app()
+    try:
+        original = generate(client, tenant="tenant-a", model="model-v1", locale="en")
+        other_tenant = generate(client, tenant="tenant-b", model="model-v1", locale="en")
+        other_model = generate(client, tenant="tenant-a", model="model-v2", locale="en")
+        other_locale = generate(client, tenant="tenant-a", model="model-v1", locale="fr")
+        original_again = generate(client, tenant="tenant-a", model="model-v1", locale="en")
+
+        assert [response.headers["x-cache-status"] for response in (
+            original, other_tenant, other_model, other_locale, original_again
+        )] == ["MISS", "MISS", "MISS", "MISS", "HIT"]
+    finally:
+        client.close()
+
+
+def test_invalidation_only_removes_requested_tenant_scope():
+    client = setup_app()
+    try:
+        generate(client, tenant="tenant-a", model="model-v1", locale="en")
+        generate(client, tenant="tenant-a", model="model-v1", locale="fr")
+        generate(client, tenant="tenant-b", model="model-v1", locale="en")
+
+        invalidated = client.request(
+            "DELETE",
+            "/v1/cache",
+            headers={"X-Tenant-ID": "tenant-a"},
+            json={"model": "model-v1", "locale": "en"},
+        )
+        assert invalidated.status_code == 200
+        assert invalidated.json()["deleted_entries"] == 1
+
+        tenant_a_en = generate(client, tenant="tenant-a", model="model-v1", locale="en")
+        tenant_a_fr = generate(client, tenant="tenant-a", model="model-v1", locale="fr")
+        tenant_b_en = generate(client, tenant="tenant-b", model="model-v1", locale="en")
+
+        assert tenant_a_en.headers["x-cache-status"] == "MISS"
+        assert tenant_a_fr.headers["x-cache-status"] == "HIT"
+        assert tenant_b_en.headers["x-cache-status"] == "HIT"
     finally:
         client.close()
 
@@ -84,15 +139,14 @@ def test_cache_can_be_bypassed():
         client.close()
 
 
-def test_invalidate_endpoint():
+def test_invalid_tenant_header_is_rejected():
     client = setup_app()
     try:
-        response = client.delete(
-            "/v1/cache",
-            headers={"X-Tenant-ID": "tenant-a"},
-            json={"model": "test-model", "locale": "en"},
+        response = client.post(
+            "/v1/generate",
+            headers={"X-Tenant-ID": "   "},
+            json={"prompt": "hello"},
         )
-        assert response.status_code == 200
-        assert response.json()["deleted_entries"] == 0
+        assert response.status_code == 400
     finally:
         client.close()
